@@ -56,6 +56,14 @@ import java.util.UUID;
 import java.util.concurrent.Callable;
 
 
+import android.content.ContentUris;
+import android.database.Cursor;
+import androidx.core.content.ContextCompat;
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
+
+
 
 class PickerModule extends ReactContextBaseJavaModule implements ActivityEventListener {
 
@@ -73,6 +81,7 @@ class PickerModule extends ReactContextBaseJavaModule implements ActivityEventLi
     private static final String E_CAMERA_IS_NOT_AVAILABLE = "E_CAMERA_IS_NOT_AVAILABLE";
     private static final String E_CANNOT_LAUNCH_CAMERA = "E_CANNOT_LAUNCH_CAMERA";
     private static final String E_ERROR_WHILE_CLEANING_FILES = "E_ERROR_WHILE_CLEANING_FILES";
+    private static final String E_LOW_MEMORY_ERROR = "E_LOW_MEMORY_ERROR";
 
     private static final String E_NO_LIBRARY_PERMISSION_KEY = "E_NO_LIBRARY_PERMISSION";
     private static final String E_NO_LIBRARY_PERMISSION_MSG = "User did not grant library permission.";
@@ -368,34 +377,104 @@ class PickerModule extends ReactContextBaseJavaModule implements ActivityEventLi
     private void initiatePicker(final Activity activity) {
         try {
             PickVisualMediaRequest.Builder builder = new PickVisualMediaRequest.Builder();
-            PickVisualMediaRequest request = new PickVisualMediaRequest();
-
-            if (cropping || mediaType.equals("photo")) {
-                request = builder.setMediaType(new ActivityResultContracts.PickVisualMedia.SingleMimeType("image/*")).build();
-            }
-            else{
-                if (cropping) {
-                    request = builder.setMediaType(ActivityResultContracts.PickVisualMedia.ImageOnly.INSTANCE).build();
-                }
-             else if (mediaType.equals("video")) {
-                request = builder.setMediaType(ActivityResultContracts.PickVisualMedia.VideoOnly.INSTANCE).build();
+            // Simplified media type handling
+            if (mediaType.equals("video")) {
+                builder.setMediaType(ActivityResultContracts.PickVisualMedia.VideoOnly.INSTANCE);
+            } else if (mediaType.equals("photo") || cropping) {
+                // Force image-only for cropping
+                builder.setMediaType(ActivityResultContracts.PickVisualMedia.ImageOnly.INSTANCE);
             } else {
-                    request = builder.setMediaType(ActivityResultContracts.PickVisualMedia.ImageAndVideo.INSTANCE).build();
-                }
+                builder.setMediaType(ActivityResultContracts.PickVisualMedia.ImageAndVideo.INSTANCE);
             }
 
             Intent intent;
-
             if (multiple) {
-                intent = new ActivityResultContracts.PickMultipleVisualMedia().createIntent(activity, request);
+                intent = new ActivityResultContracts.PickMultipleVisualMedia().createIntent(activity, builder.build());
             } else {
-                intent = new ActivityResultContracts.PickVisualMedia().createIntent(activity, request);
+                intent = new ActivityResultContracts.PickVisualMedia().createIntent(activity, builder.build());
             }
 
             activity.startActivityForResult(intent, IMAGE_PICKER_REQUEST);
         } catch (Exception e) {
             resultCollector.notifyProblem(E_FAILED_TO_SHOW_PICKER, e);
         }
+    }
+
+    static class Media {
+        private final Uri uri;
+        private final String name;
+        private final long size;
+        private final String mimeType;
+
+        public Media(Uri uri, String name, long size, String mimeType) {
+            this.uri = uri;
+            this.name = name;
+            this.size = size;
+            this.mimeType = mimeType;
+        }
+
+        // Getters
+        public Uri getUri() {
+            return uri;
+        }
+
+        public String getName() {
+            return name;
+        }
+
+        public long getSize() {
+            return size;
+        }
+
+        public String getMimeType() {
+            return mimeType;
+        }
+
+
+    }
+
+    // Run the querying logic in a coroutine outside of the main thread to keep the app responsive.
+    // Keep in mind that this code snippet is querying only images of the shared storage.
+    public List<Media> getImages(ContentResolver contentResolver) {
+        // Partial access on Android 14 (API level 34) or higher
+        String[] projection = new String[]{
+                MediaStore.Images.Media._ID,
+                MediaStore.Images.Media.DISPLAY_NAME,
+                MediaStore.Images.Media.SIZE,
+                MediaStore.Images.Media.MIME_TYPE,
+        };
+
+        Uri collectionUri;
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+            // Query all the device storage volumes instead of the primary only
+            collectionUri = MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL);
+        } else {
+            collectionUri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI;
+        }
+        List<Media> images = new ArrayList<>();
+
+        try (Cursor cursor = contentResolver.query(
+                collectionUri,
+                projection,
+                null,
+                null,
+                MediaStore.Images.Media.DATE_ADDED + " DESC")) {
+            if (cursor != null) {
+                int idColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID);
+                int displayNameColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME);
+                int sizeColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.SIZE);
+                int mimeTypeColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.MIME_TYPE);
+                while (cursor.moveToNext()) {
+                    Uri uri = ContentUris.withAppendedId(collectionUri, cursor.getLong(idColumn));
+                    String name = cursor.getString(displayNameColumn);
+                    long size = cursor.getLong(sizeColumn);
+                    String mimeType = cursor.getString(mimeTypeColumn);
+                    Media image = new Media(uri, name, size, mimeType);
+                    images.add(image);
+                }
+            }
+        }
+        return images;
     }
 
     @ReactMethod
@@ -417,6 +496,58 @@ class PickerModule extends ReactContextBaseJavaModule implements ActivityEventLi
                 return null;
             }
         });
+    }
+
+
+    @ReactMethod
+    public void openAndroidPicker(final Promise promise) throws JSONException {
+        Log.e("CUSTOM_MESSAGE", "STARTING..");
+        final Activity activity = getCurrentActivity();
+        String permission = "";
+
+        if (activity == null) {
+            promise.reject(E_ACTIVITY_DOES_NOT_EXIST, "Activity doesn't exist");
+            return ;
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            permission = Manifest.permission.READ_MEDIA_IMAGES;
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            permission = Manifest.permission.WRITE_EXTERNAL_STORAGE;
+        }
+
+
+        Log.e("CUSTOM_MESSAGE", permission);
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && ContextCompat.checkSelfPermission(this.reactContext, Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED) {
+            Log.e("CUSTOM_MESSAGE","Full access on Android 13 (API level 33) or higher");
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE && ContextCompat.checkSelfPermission(this.reactContext, Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED) == PackageManager.PERMISSION_GRANTED) {
+            permission = "";
+            Log.e("CUSTOM_MESSAGE","Partial access on Android 14 (API level 34) or higher");
+             final var images = getImages(this.reactContext.getContentResolver());
+            JSONArray jsonArray = new JSONArray();
+            for (Media obj : images) {
+                JSONObject jsonObject = new JSONObject();
+                jsonObject.put("uri", obj.uri);
+                jsonArray.put(jsonObject);
+            }
+            promise.resolve(jsonArray.toString());
+            return ;
+        }  else if (ContextCompat.checkSelfPermission(this.reactContext, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED) {
+            Log.e("CUSTOM_MESSAGE","Full access up to Android 12 (API level 32)");
+        } else {
+            Log.e("CUSTOM_MESSAGE","Access denied");
+        }
+
+        Log.e("CUSTOM_MESSAGE 1", permission);
+        if(!permission.isEmpty())
+            permissionsCheck(activity, promise, Collections.singletonList(permission), new Callable<Void>() {
+                @Override
+                public Void call() {
+                    initiatePicker(activity);
+                    return null;
+                }
+            });
     }
 
     @ReactMethod
@@ -515,15 +646,16 @@ class PickerModule extends ReactContextBaseJavaModule implements ActivityEventLi
         resultCollector.notifySuccess(getImage(activity, path));
     }
 
-    private Bitmap validateVideo(String path) throws Exception {
+    private Bitmap validateVideo(Uri uri) throws Exception {
         MediaMetadataRetriever retriever = new MediaMetadataRetriever();
-        retriever.setDataSource(path);
+        retriever.setDataSource(getCurrentActivity(), uri);
         Bitmap bmp = retriever.getFrameAtTime();
 
         if (bmp == null) {
             throw new Exception("Cannot retrieve video data");
         }
 
+        retriever.release();
         return bmp;
     }
 
@@ -540,7 +672,7 @@ class PickerModule extends ReactContextBaseJavaModule implements ActivityEventLi
     }
 
     private void getVideo(final Activity activity, final String path, final String mime) throws Exception {
-        validateVideo(path);
+        validateVideo(Uri.parse(path));
         final String compressedVideoPath = getTmpDir(activity) + "/" + UUID.randomUUID().toString() + ".mp4";
 
         new Thread(new Runnable() {
@@ -550,21 +682,24 @@ class PickerModule extends ReactContextBaseJavaModule implements ActivityEventLi
                     @Override
                     public void invoke(Object... args) {
                         String videoPath = (String) args[0];
-
                         try {
-                            Bitmap bmp = validateVideo(videoPath);
-                            long modificationDate = new File(videoPath).lastModified();
+                            File file = new File(videoPath);
+                            Uri videoUri = Uri.fromFile(file);
+                            MediaMetadataRetriever retriever = new MediaMetadataRetriever();
+                            retriever.setDataSource(activity, videoUri);
+                            Bitmap bmp = retriever.getFrameAtTime();
                             long duration = getVideoDuration(videoPath);
 
                             WritableMap video = new WritableNativeMap();
                             video.putInt("width", bmp.getWidth());
                             video.putInt("height", bmp.getHeight());
                             video.putString("mime", mime);
-                            video.putInt("size", (int) new File(videoPath).length());
+                            video.putInt("size", (int) file.length());
                             video.putInt("duration", (int) duration);
                             video.putString("path", "file://" + videoPath);
-                            video.putString("modificationDate", String.valueOf(modificationDate));
+                            video.putString("modificationDate", String.valueOf(file.lastModified()));
 
+                            retriever.release();
                             resultCollector.notifySuccess(video);
                         } catch (Exception e) {
                             resultCollector.notifyProblem(E_NO_IMAGE_DATA_FOUND, e);
@@ -596,6 +731,11 @@ class PickerModule extends ReactContextBaseJavaModule implements ActivityEventLi
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            // For videos, get the real path but don't copy the file
+            String mimeType = activity.getContentResolver().getType(uri);
+            if (mimeType != null && mimeType.startsWith("video/")) {
+                return RealPathUtil.getRealPathFromURI(activity, uri);
+            }
 
             String externalCacheDirPath = Uri.fromFile(activity.getExternalCacheDir()).getPath();
             String externalFilesDirPath = Uri.fromFile(activity.getExternalFilesDir(null)).getPath();
@@ -873,7 +1013,12 @@ class PickerModule extends ReactContextBaseJavaModule implements ActivityEventLi
             if (resultUri != null) {
                 try {
                     if (width > 0 && height > 0) {
-                        File resized = compression.resize(this.reactContext, resultUri.getPath(), width, height, width, height, 100);
+                        File resized = null;
+                        try{
+                            resized = compression.resize(this.reactContext, resultUri.getPath(), width, height, width, height, 100);
+                        } catch (OutOfMemoryError ex) {
+                            resultCollector.notifyProblem(E_LOW_MEMORY_ERROR, ex.getMessage());
+                        }
                         resultUri = Uri.fromFile(resized);
                     }
 
